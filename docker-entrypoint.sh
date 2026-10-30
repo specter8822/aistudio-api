@@ -10,7 +10,7 @@ BACKUP_ON=0
 if [ -n "$BACKUP_REPO" ] && [ -n "$GITHUB_TOKEN" ] && [ -n "$BACKUP_PASSPHRASE" ]; then
   rm -rf /tmp/restore
   if git clone -q --depth 1 "$REPO_URL" /tmp/restore 2>/dev/null; then
-    BACKUP_ON=1   # 仓库可访问，才允许后续备份
+    BACKUP_ON=1
     if [ -f /tmp/restore/backup.enc ]; then
       openssl enc -d -aes-256-cbc -pbkdf2 -pass env:BACKUP_PASSPHRASE \
         -in /tmp/restore/backup.enc | tar xz -C "$DATA" \
