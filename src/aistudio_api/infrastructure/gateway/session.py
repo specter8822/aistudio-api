@@ -114,6 +114,7 @@ class BrowserSession:
 
     def set_ready_context(self, context: SessionContext) -> None:
         """Set active ready context (used by transitions and test fixtures)."""
+        self._auth_file = context.auth_file
         self._gate.set_ready(context)
 
     def get_current_auth_user(self) -> str:
@@ -141,7 +142,7 @@ class BrowserSession:
         finally:
             self._in_flight = max(0, self._in_flight - 1)
 
-    async def ensure_ready(self, timeout_s: float = 120.0) -> SessionContext:
+    async def ensure_ready(self) -> SessionContext:
         """Wait until session is 100% READY."""
         if self._gate.is_ready() and self._gate.active_context is not None:
             return self._gate.active_context
@@ -149,7 +150,7 @@ class BrowserSession:
         if self._gate.state == SessionState.UNINITIALIZED:
             await self.transition_to_account(self._auth_file, force_refresh=False)
 
-        return await self._gate.wait_ready(timeout_s=timeout_s)
+        return await self._gate.wait_ready()
 
     async def ensure_context(self) -> CDPPage:
         """Ensure active verified CDPPage is available, auto-reconnecting if dropped."""
@@ -178,6 +179,15 @@ class BrowserSession:
         self, auth_file: str | None, force_refresh: bool = False
     ) -> SessionContext:
         """Execute atomic session transition to target auth file."""
+        if (
+            not force_refresh
+            and self._gate.is_ready()
+            and self._gate.active_context is not None
+            and self._gate.active_context.auth_file == auth_file
+        ):
+            return self._gate.active_context
+
+        self._gate.set_preparing()
         async with self._transition_lock:
             if (
                 not force_refresh
@@ -230,6 +240,8 @@ class BrowserSession:
                     ),
                 )
 
+                new_page._cached_cookies = None
+                await save_browser_cookies(new_page, auth_file)
                 target_tier = get_tier_from_meta(auth_file)
                 self._tier = target_tier
                 new_context = SessionContext(
@@ -288,17 +300,12 @@ class BrowserSession:
         self,
         context: SessionContext,
         active_target_id: str | None = None,
-        max_wait_s: float = 600.0,
     ) -> None:
-        deadline = asyncio.get_running_loop().time() + max_wait_s
         while context.in_flight > 0:
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0 or context.page.is_closed():
+            if context.page.is_closed():
                 break
             with suppress(TimeoutError):
-                await asyncio.wait_for(
-                    context.drain_event.wait(), timeout=min(remaining, 2.0)
-                )
+                await asyncio.wait_for(context.drain_event.wait(), timeout=2.0)
                 break
 
         with suppress(Exception):
@@ -326,12 +333,16 @@ class BrowserSession:
             )
         return (await self.ensure_ready()).page
 
-    async def capture_template(self, model: str) -> dict[str, object]:
+    async def capture_template(
+        self, model: str, ctx: SessionContext | None = None
+    ) -> dict[str, object]:
         if self._proc is not None and not self._proc.is_alive():
             raise RuntimeError("Browser process died during template capture")
 
-        ctx = self.active_context
-        base = dict(ctx.base_template if ctx else DEFAULT_BOOTSTRAP_TEMPLATE)
+        active_ctx = ctx or self.active_context
+        base = dict(
+            active_ctx.base_template if active_ctx else DEFAULT_BOOTSTRAP_TEMPLATE
+        )
         normalized_model = model if model.startswith("models/") else f"models/{model}"
         try:
             body_val = base.get("body")
@@ -351,8 +362,12 @@ class BrowserSession:
             log.debug("Failed to adapt model into base template body: %s", e)
         return base
 
-    async def generate_snapshot(self, contents: list[AistudioContent]) -> str:
-        ctx = await self.ensure_ready()
+    async def generate_snapshot(
+        self,
+        contents: list[AistudioContent],
+        ctx: SessionContext | None = None,
+    ) -> str:
+        active_ctx = ctx or await self.ensure_ready()
         hash_parts: list[str] = []
         for content in contents:
             for part in content.parts:
@@ -367,17 +382,17 @@ class BrowserSession:
         content_hash = sha256(" ".join(hash_parts).encode("utf-8")).hexdigest()
 
         async with self._snapshot_lock:
-            for attempt in range(3):
+            for attempt in range(5):
                 try:
-                    snapshot = await ctx.page.evaluate(
+                    snapshot = await active_ctx.page.evaluate(
                         SNAPSHOT_GENERATE_JS, args=content_hash, timeout_s=25.0
                     )
                     if snapshot and isinstance(snapshot, str) and len(snapshot) > 0:
                         return snapshot
                 except Exception as e:
                     log.debug("快照计算第 %d 次尝试失败: %s", attempt + 1, e)
-                    if attempt < 2:
-                        await ctx.page.wait_for_timeout(100)
+                if attempt < 4:
+                    await active_ctx.page.wait_for_timeout(250)
 
         raise RuntimeError(
             f"Snapshot generation failed for content hash {content_hash[:8]}"
@@ -387,11 +402,11 @@ class BrowserSession:
         self,
         *,
         body: str,
-        timeout_ms: int,
         url: str | None = None,
         headers: dict[str, str] | None = None,
+        ctx: object | None = None,
     ) -> tuple[int, bytes]:
-        ctx = await self.ensure_ready()
+        ctx = ctx if isinstance(ctx, SessionContext) else await self.ensure_ready()
         captured_url = url or str(ctx.base_template.get("url") or "")
         hdrs_val = ctx.base_template.get("headers")
         captured_headers = headers or (
@@ -406,7 +421,6 @@ class BrowserSession:
                 url=captured_url,
                 headers=captured_headers,
                 body=body,
-                timeout_ms=timeout_ms,
                 auth_user=ctx.auth_user,
                 tier=ctx.tier,
             )
@@ -417,11 +431,11 @@ class BrowserSession:
         self,
         *,
         body: str,
-        timeout_ms: int,
         url: str | None = None,
         headers: dict[str, str] | None = None,
+        ctx: object | None = None,
     ) -> AsyncGenerator[tuple[str, object], None]:
-        ctx = await self.ensure_ready()
+        ctx = ctx if isinstance(ctx, SessionContext) else await self.ensure_ready()
         captured_url = url or str(ctx.base_template.get("url") or "")
         hdrs_val = ctx.base_template.get("headers")
         captured_headers = headers or (
@@ -436,7 +450,6 @@ class BrowserSession:
                 url=captured_url,
                 headers=captured_headers,
                 body=body,
-                timeout_ms=timeout_ms,
                 auth_user=ctx.auth_user,
                 tier=ctx.tier,
             ):
