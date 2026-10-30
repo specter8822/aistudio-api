@@ -1,20 +1,31 @@
 #!/bin/sh
 set -e
 
-CONFIG_FILE="${AISTUDIO_CONFIG_FILE:-/app/data/config.yaml}"
-TEMPLATE_FILE="/app/defaults/config.yaml"
-FALLBACK_TEMPLATE="/app/config.yaml"
+DATA="${AISTUDIO_DATA_DIR:-/app/data}"
+CONFIG_FILE="${AISTUDIO_CONFIG_FILE:-$DATA/config.yaml}"
+REMOTE="r2:${R2_BUCKET}/aistudio"
+EXCL="--exclude accounts/*/profile/**"
 
-if [ ! -f "$CONFIG_FILE" ]; then
-    if [ -f "$TEMPLATE_FILE" ]; then
-        mkdir -p "$(dirname "$CONFIG_FILE")"
-        cp "$TEMPLATE_FILE" "$CONFIG_FILE"
-        echo "[entrypoint] Initialized default config.yaml at $CONFIG_FILE from $TEMPLATE_FILE"
-    elif [ -f "$FALLBACK_TEMPLATE" ]; then
-        mkdir -p "$(dirname "$CONFIG_FILE")"
-        cp "$FALLBACK_TEMPLATE" "$CONFIG_FILE"
-        echo "[entrypoint] Initialized default config.yaml at $CONFIG_FILE from $FALLBACK_TEMPLATE"
-    fi
+mkdir -p "$DATA"
+
+# 1) 启动时从 R2 恢复
+if [ -n "$RCLONE_CONFIG_R2_TYPE" ]; then
+  rclone copy "$REMOTE" "$DATA" $EXCL || echo "[backup] restore failed"
+fi
+
+# 2) 没有配置则用模板
+if [ ! -f "$CONFIG_FILE" ] && [ -f /app/defaults/config.yaml ]; then
+  cp /app/defaults/config.yaml "$CONFIG_FILE"
+fi
+
+# 3) 每 60 秒备份一次
+if [ -n "$RCLONE_CONFIG_R2_TYPE" ]; then
+  (
+    while true; do
+      sleep 60
+      rclone copy "$DATA" "$REMOTE" $EXCL || true
+    done
+  ) &
 fi
 
 exec "$@"
