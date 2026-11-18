@@ -1,11 +1,19 @@
 FROM golang:1.27-bookworm AS builder
 WORKDIR /build
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils build-essential file && rm -rf /var/lib/apt/lists/ && curl -fsSL https://ziglang.org/download/0.16.0/zig-$(uname -m)-linux-0.16.0.tar.xz | tar -xJ -C /opt && mv /opt/zig- /opt/zig && ln -s /opt/zig/zig /usr/local/bin/zig
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl xz-utils build-essential file \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL "https://ziglang.org/download/0.16.0/zig-$(uname -m)-linux-0.16.0.tar.xz" | tar -xJ -C /opt \
+    && mv /opt/zig-* /opt/zig \
+    && ln -s /opt/zig/zig /usr/local/bin/zig
+
 COPY . .
 RUN chmod +x build.sh && ./build.sh
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /build/bin/waa-signer /app/waa-signer
 RUN chmod +x /app/waa-signer
